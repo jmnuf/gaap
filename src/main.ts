@@ -5,13 +5,12 @@ import type { Option } from "./yielder";
 
 const Option = Enums.Option;
 
-type StateName = "idle" | "moving" | "action";
-type AppliedTo = "agent" | "world" | "both";
 interface IStore {
   set(key: string, value: unknown): boolean;
   get<T = unknown>(key: string): Option<T>;
   put(key: string, value: unknown): boolean;
   keys(): Array<string>;
+  has(key: string): boolean;
 }
 type Concept = {
   agent: IStore;
@@ -19,7 +18,7 @@ type Concept = {
 };
 type ActionEffect = {
   name: string;
-  on: AppliedTo;
+  on: "agent" | "world";
   apply: (agent: IStore, world: IStore) => any;
   check: (agent: IStore, world: IStore) => Option<Concept>;
 };
@@ -29,12 +28,6 @@ type Action = {
   effects: Array<ActionEffect>;
   cost: number;
 };
-// type Expectation = {
-//   name: string;
-//   on: AppliedTo;
-//   property: string;
-//   value: ((v: unknown) => boolean) | unknown;
-// };
 const cmp = Object.freeze({
   GT: Symbol("cmp::gt"),
   LT: Symbol("cmp::lt"),
@@ -43,7 +36,7 @@ const cmp = Object.freeze({
 type Comparison = (typeof cmp)[keyof typeof cmp];
 type Expects = {
   name: string;
-  target: "agent" | "world";
+  target: ActionEffect["on"];
   property: string;
   compare(a: Concept, b: Concept): Comparison;
   check(agent: IStore, world: IStore): boolean;
@@ -107,20 +100,34 @@ function goalCmp(
   return cmp.EQ;
 }
 
+function planCost(plan: Array<Action>) {
+  return plan.reduce((cost, action) => cost + action.cost, 0);
+}
+
 class Planner implements IPlanner {
   #actions: Array<Action> = [];
+  #ambientActions: Array<Action> = [];
+
+  constructor() {
+    this.setActions = this.setActions.bind(this);
+    this.setAmbientActions = this.setAmbientActions.bind(this);
+    this.plan = this.plan.bind(this);
+  }
+
   setActions(actions: Array<Action>) {
     this.#actions = [...actions];
     this.#actions.sort((a, b) => a.cost - b.cost);
-    console.log("Actions set", this.#actions);
+    console.log(
+      "Actions set",
+      this.#actions.map((a) => a.name),
+    );
   }
-
-  private checkAction(agent: IStore, world: IStore, action: Action) {
-    const fakeAgent = pseudoAgentFrom("CheckActionAgent", agent);
-    const fakeWorld = pseudoAgentFrom("CheckActionWorld", world);
-    if (!action.canPerform(fakeAgent, fakeWorld)) return Option.None;
-    applyAction(fakeAgent, fakeWorld, action);
-    return Option.Some({ agent: fakeAgent, world: fakeWorld });
+  setAmbientActions(actions: Array<Action>) {
+    this.#ambientActions = actions;
+    console.log(
+      "Ambient Actions set",
+      this.#ambientActions.map((a) => a.name),
+    );
   }
 
   private plan_introspection(
@@ -132,34 +139,61 @@ class Planner implements IPlanner {
   ): Array<Array<Action>> {
     if (depth <= 0) return [plan];
     let plans = [];
+    // TODO: Figure out why it has a melt down if it can use the previous action
     const actions = this.#actions.filter((act) => plan[plan.length - 1] != act);
-    console.assert(actions.length == this.#actions.length - 1);
     for (const action of actions) {
-      const introspection = this.plan_introspection(
+      const simAgent = pseudoAgentFrom(`PerformableCheck${depth}Agent`, agent);
+      const simWorld = pseudoAgentFrom(`PerformableCheck${depth}World`, world);
+      this.simulate_in_place(plan, simAgent, simWorld);
+      if (!action.canPerform(simAgent, simWorld)) continue;
+      const p = [...plan, action];
+      plans.push(p);
+    }
+    let introspected = [];
+    for (;;) {
+      const p = plans.pop()!;
+      if (!p) break;
+      const introsPls = this.plan_introspection(
         goal,
-        [...plan, action],
+        p,
         agent,
         world,
         depth - 1,
       );
-      const p = introspection[0];
-      plans.push(p);
+      for (const introsPlan of introsPls) {
+        const simAgent = pseudoAgentFrom(`IntrospectDepth${depth}Agent`, agent);
+        const simWorld = pseudoAgentFrom(`IntrospectDepth${depth}World`, world);
+        const p = introsPlan;
+        this.simulate_in_place(p, simAgent, simWorld);
+        introspected.push({
+          plan: introsPlan,
+          agent: simAgent,
+          world: simWorld,
+        });
+      }
     }
-    plans.sort((a, b) => {
-      const agentA = pseudoAgentFrom("IntrospectSortingAgentA", agent);
-      const worldA = pseudoAgentFrom("IntrospectSortingWorldA", world);
-      const agentB = pseudoAgentFrom("IntrospectSortingAgentB", agent);
-      const worldB = pseudoAgentFrom("IntrospectSortingWorldB", world);
-      this.simulate_in_place(a, agentA, worldA);
-      this.simulate_in_place(b, agentB, worldB);
-      const c = goalCmp(goal, agentA, worldA, agentB, worldB);
-      return c == cmp.GT ? -1 : c == cmp.LT ? 1 : 0;
-    });
-    return plans;
+    introspected.sort(
+      (
+        { plan: planA, agent: agentA, world: worldA },
+        { plan: planB, agent: agentB, world: worldB },
+      ) => {
+        const c = goalCmp(goal, agentA, worldA, agentB, worldB);
+        return c == cmp.GT
+          ? -1
+          : c == cmp.LT
+            ? 1
+            : planCost(planA) - planCost(planB);
+      },
+    );
+
+    return introspected.filter((_x, i) => i < 3).map((x) => x.plan);
   }
 
   private simulate_in_place(plan: Array<Action>, agent: IStore, world: IStore) {
-    for (let i = plan.length - 1; i >= 0; --i) {
+    for (let i = 0; i < plan.length; ++i) {
+      for (const a of this.#ambientActions) {
+        applyAction(agent, world, a);
+      }
       const action = plan[i];
       if (!action.canPerform(agent, world)) {
         return false;
@@ -178,19 +212,9 @@ class Planner implements IPlanner {
   ): Option<Action> {
     if (depth <= 0) return Option.None;
     const newPlans = this.plan_introspection(goal, plan, agent, world, depth);
-    // console.log("plans introspection sorted", newPlans);
-    // {
-    //   const agentA = pseudoAgentFrom("IntrospectSortingAgentA", agent);
-    //   const worldA = pseudoAgentFrom("IntrospectSortingWorldA", world);
-    //   const agentB = pseudoAgentFrom("IntrospectSortingAgentB", agent);
-    //   const worldB = pseudoAgentFrom("IntrospectSortingWorldB", world);
-    //   this.simulate_in_place(newPlans[0], agentA, worldA);
-    //   this.simulate_in_place(newPlans[1], agentB, worldB);
-    //   const c = goalCmp(goal, agentA, worldA, agentB, worldB);
-    //   console.assert(c != cmp.LT, "First plan should be highest rated!");
-    // }
     const newPlan = newPlans[0];
     if (newPlan.length <= plan.length) {
+      console.log("Didn't expand plan");
       return Option.None;
     }
     const action = newPlan[plan.length];
@@ -205,69 +229,28 @@ class Planner implements IPlanner {
   ): boolean {
     const fAgent = pseudoAgentFrom("SimulatedAgent", agent);
     const fWorld = pseudoAgentFrom("SimulatedWorld", world);
-    for (let i = plan.length - 1; i >= 0; --i) {
-      const action = plan[i];
-      if (!action.canPerform(fAgent, fWorld)) {
-        return false;
-      }
-      applyAction(fAgent, fWorld, action);
-    }
+    if (!this.simulate_in_place(plan, fAgent, fWorld)) return false;
     return goalReached(goal, fAgent, fWorld);
   }
 
   plan(goal: Goal, agent: IStore, world: IStore): Option<Array<Action>> {
     console.log("Planning for goal:", goal.name);
-    const expectations = [];
-    for (const expec of goal.expectations) {
-      if (!expec.check(agent, world)) {
-        expectations.push(expec);
-      }
-    }
-    console.log("Expectations to meet:", expectations);
+    // TODO: A smart way to extract the needed expectations for plan calculation
+    const expectations = goal.expectations.slice();
+    console.log(
+      "Expectations to meet:",
+      expectations.map((e) => e.name),
+    );
     if (expectations.length == 0) {
       return Option.Some([NOOP]);
     }
 
-    const possibleActions: Array<{ performable: boolean; action: Action }> = [];
-    for (const action of this.#actions) {
-      for (const effect of action.effects) {
-        const tmpOpt = effect.check(agent, world);
-        if (!Option.is_some(tmpOpt)) {
-          continue;
-        }
-        const tmp = tmpOpt.unwrap();
-        for (const expec of expectations) {
-          if (expec.compare(tmp, { agent, world }) == cmp.GT) {
-            const performable = action.canPerform(agent, world);
-            possibleActions.push({ performable, action });
-          }
-        }
-      }
-    }
-    console.log("Possible Actions:", possibleActions);
-    if (possibleActions.length == 0) {
-      return Option.None;
-    }
-    const actionsPlan = possibleActions
-      .filter((pa) => pa.performable)
-      .map((pa) => pa.action);
-    if (actionsPlan.length > 0) {
-      return Option.Some(actionsPlan);
-    }
+    const actionsPlan = [];
     let planDone = false;
-    let goalAction = possibleActions[0].action;
-    let maxIterations = 20;
-    actionsPlan.push(goalAction);
+    let maxIterations = 50;
     while (!planDone && maxIterations > 0) {
       maxIterations -= 1;
-      const doOpt = this.introspect(
-        goal,
-        actionsPlan,
-        agent,
-        world,
-        // pseudoAgentFrom("IntrospectionAgent", agent),
-        // pseudoAgentFrom("IntrospectionWorld", world),
-      );
+      const doOpt = this.introspect(goal, actionsPlan, agent, world);
       if (!Option.is_some(doOpt)) return Option.None;
       const op = doOpt.unwrap();
       actionsPlan.push(op);
@@ -276,13 +259,14 @@ class Planner implements IPlanner {
       }
     }
 
-    console.log("Actions Plan:", actionsPlan);
-
     return Option.Some(actionsPlan);
   }
 }
 
-type PseudoAgent = IStore & { print(): void };
+interface PseudoAgent extends IStore {
+  print(): void;
+  json(): Record<string, unknown>;
+}
 const createPseudoAgent = (name: string): PseudoAgent => {
   const values = new Map<string, unknown>();
   return {
@@ -302,11 +286,20 @@ const createPseudoAgent = (name: string): PseudoAgent => {
       values.set(key, value);
       return true;
     },
+    has(key: string): boolean {
+      return values.has(key);
+    },
     keys() {
       return [...values.keys()];
     },
     print() {
-      console.log({ name, entries: [...values.entries()] });
+      const data = this.json();
+      console.log(`[Object ${name}<${JSON.stringify(data)}>]`);
+    },
+    json() {
+      const data = {} as any;
+      for (const [key, val] of values.entries()) data[key] = val;
+      return data;
     },
   };
 };
@@ -318,61 +311,53 @@ const pseudoAgentFrom = (name: string, store: IStore): PseudoAgent => {
   return agent;
 };
 
-const takeFromWorldEffect = (
-  amount: number,
-  worldProp: string,
-  agentProp: string = worldProp,
-) => {
-  const apply = (agent: IStore, world: IStore) => {
-    const agentAmt = agent.get<number>(agentProp).unwrap();
-    const worldAmt = world.get<number>(worldProp).unwrap();
-    agent.set(agentProp, agentAmt + amount);
-    world.set(worldProp, worldAmt + amount);
-  };
-  const check = (
-    agent: IStore,
-    world: IStore,
-  ): Option<{ agent: IStore; world: IStore }> => {
-    if (!Option.is_some(agent.get(agentProp))) {
-      return Option.None;
+const pseudoAgentSetup = <T extends Record<string, any>>(
+  name: string,
+  origin: T,
+): PseudoAgent => {
+  const agent = createPseudoAgent(name);
+  for (const [key, val] of Object.entries(origin)) {
+    if (agent.has(key)) {
+      agent.set(key, val);
+    } else {
+      agent.put(key, val);
     }
-    if (!Option.is_some(world.get(worldProp))) {
-      return Option.None;
-    }
-    const fakeAgent = pseudoAgentFrom("fakeAgent", agent);
-    const fakeWorld = pseudoAgentFrom("fakeAgent", world);
-    apply(fakeAgent, fakeWorld);
-    return Option.Some({ agent: fakeAgent, world: fakeWorld });
-  };
-  return {
-    name: `take ${worldProp} from world`,
-    on: "both" as const,
-    apply,
-    check,
-  };
+  }
+  return agent;
 };
 
-const changeAmtEffect = (amount: number, on: AppliedTo, propName: string) => {
+const changeAmtEffect = (
+  a: number | [number, number, number],
+  on: ActionEffect["on"],
+  propName: string,
+) => {
+  let amount: number = 0;
+  let min: number = -Infinity;
+  let max: number = Infinity;
+  if (typeof a == "number") {
+    amount = a;
+  } else {
+    amount = a[0];
+    min = a[1];
+    max = a[2];
+  }
+  const updateStore = (store: IStore) =>
+    store.set(
+      propName,
+      Math.min(
+        Math.max(store.get<number>(propName).unwrap() + amount, min),
+        max,
+      ),
+    );
   const apply =
     on == "agent"
-      ? (agent: IStore, _world: IStore) => {
-          agent.set(propName, agent.get<number>(propName).unwrap() + amount);
-        }
-      : on == "world"
-        ? (_agent: IStore, world: IStore) => {
-            world.set(propName, world.get<number>(propName).unwrap() + amount);
-          }
-        : (agent: IStore, world: IStore) => {
-            agent.set(propName, agent.get<number>(propName).unwrap() + amount);
-            world.set(propName, world.get<number>(propName).unwrap() + amount);
-          };
+      ? (agent: IStore, _world: IStore) => updateStore(agent)
+      : (_agent: IStore, world: IStore) => updateStore(world);
   const check = (agent: IStore, world: IStore) => {
     const aO = agent.get(propName);
     const wO = world.get(propName);
-    if ((on == "agent" || on == "both") && !Option.is_some(aO))
-      return Option.None;
-    if ((on == "world" || on == "both") && !Option.is_some(wO))
-      return Option.None;
+    if (on == "agent" && !Option.is_some(aO)) return Option.None;
+    if (on == "world" && !Option.is_some(wO)) return Option.None;
 
     const fA = pseudoAgentFrom("fakeAgent", agent);
     const fW = pseudoAgentFrom("fakeWorld", world);
@@ -389,53 +374,124 @@ const changeAmtEffect = (amount: number, on: AppliedTo, propName: string) => {
   };
 };
 
+class ExpectBuilder {
+  #name: string;
+  #prop: string;
+  #target: Expects["target"];
+  #checker: Expects["check"];
+  #comparer: Expects["compare"];
+
+  constructor() {
+    this.#name = "expectation";
+    this.#prop = "<no-property>";
+    this.#target = "agent";
+    this.#checker = () => true;
+    this.#comparer = () => cmp.EQ;
+  }
+
+  name(name: string): this {
+    this.#name = name;
+    return this;
+  }
+  prop(prop: string): this {
+    this.#prop = prop;
+    return this;
+  }
+  target(target: Expects["target"]): this {
+    this.#target = target;
+    return this;
+  }
+  checker(checker: Expects["check"]): this {
+    this.#checker = checker;
+    return this;
+  }
+  comparer(comparer: Expects["compare"]): this {
+    this.#comparer = comparer;
+    return this;
+  }
+  build(): Expects {
+    const name = this.#name;
+    const property = this.#prop;
+    console.assert(typeof property == "string");
+    const target = this.#target;
+    const checker = this.#checker;
+    const check =
+      target == "agent"
+        ? (a: IStore, w: IStore) => {
+            if (!Option.is_some(a.get(property))) return false;
+            return checker(a, w);
+          }
+        : (a: IStore, w: IStore) => {
+            if (!Option.is_some(w.get(property))) return false;
+            return checker(a, w);
+          };
+    const compare = this.#comparer;
+    return {
+      name,
+      property,
+      target,
+      compare,
+      check,
+    };
+  }
+}
+
+class GoalBuilder {
+  #name: string;
+  #expectations: Array<Expects>;
+  constructor() {
+    this.#name = "goal";
+    this.#expectations = [];
+  }
+  name(name: string): this {
+    this.#name = name;
+    return this;
+  }
+  expect(expecBuild: (builder: ExpectBuilder) => Expects): this {
+    const builder = new ExpectBuilder();
+    const expec = expecBuild(builder);
+    this.#expectations.push(expec);
+    return this;
+  }
+  build(): Goal {
+    const name = this.#name;
+    const expectations = this.#expectations;
+    return { name, expectations };
+  }
+}
+function goalBuilder(): GoalBuilder {
+  return new GoalBuilder();
+}
+
+function numCmp(a: number, b: number): Comparison {
+  return a > b ? cmp.GT : b > a ? cmp.LT : cmp.EQ;
+}
+
 run(function* main() {
   console.log("Hello, World!");
   const planner = new Planner();
-  const goal: Goal = {
-    name: "keep fire",
-    expectations: [
-      {
-        name: "fire-healthy",
-        target: "world",
-        property: "fire",
-        check: (_agent: IStore, world: IStore) => {
-          const maybeFire = world.get<number>("fire");
-          console.assert(
-            Option.is_some(maybeFire),
-            "Expected fire property to always exist in world",
-          );
-          const fire = maybeFire.unwrap();
-          console.assert(
-            typeof fire == "number",
-            "Expected fire property in world to be a number",
-          );
+  const surviveGoal = goalBuilder()
+    .name("survive")
+    .expect((HealthyFire) => {
+      return HealthyFire.name("fire-healthy")
+        .target("world")
+        .prop("fire")
+        .checker((_a: IStore, world: IStore) => {
+          const fire = world.get<number>("fire").unwrap();
           return fire >= 69;
-        },
-        compare: (a: Concept, b: Concept) => {
-          const worldA = a.world;
-          const worldB = b.world;
-          const fireA = worldA.get<number>("fire").unwrap();
-          const fireB = worldB.get<number>("fire").unwrap();
-          if (fireA < 69 && fireB < 69) {
-            if (fireA > fireB) {
-              return cmp.GT;
-            }
-            if (fireB > fireA) {
-              return cmp.LT;
-            }
-            const distA = 69 - fireA;
-            const distB = 69 - fireB;
-            if (distA < distB) {
-              return cmp.GT;
-            }
-            if (distB < distA) {
-              return cmp.LT;
-            }
-            return cmp.EQ;
-          }
+        })
+        .comparer((a: Concept, b: Concept): Comparison => {
+          const fireA = a.world.get<number>("fire").unwrap();
+          const fireB = b.world.get<number>("fire").unwrap();
           const woodA = a.agent.get<number>("wood").unwrap();
           const woodB = b.agent.get<number>("wood").unwrap();
+          if (fireA < 69 && 69 > fireB) {
+            const fireCmp = numCmp(fireA, fireB);
+            if (fireCmp != cmp.EQ) return fireCmp;
+            if (woodA < 2 && woodB < 2) {
+              return cmp.EQ;
+            }
+          }
           if (woodA > woodB) {
             return cmp.GT;
           }
@@ -443,14 +499,59 @@ run(function* main() {
             return cmp.LT;
           }
           return cmp.EQ;
-        },
-      },
-    ],
-  };
+        })
+        .build();
+    })
+    .expect((HasFewWood) => {
+      return HasFewWood.name("have-wood")
+        .target("agent")
+        .prop("wood")
+        .checker((agent: IStore, _w: IStore) => {
+          const wood = agent.get<number>("wood").unwrap();
+          return wood >= 5 && wood <= 10;
+        })
+        .comparer((a: Concept, b: Concept): Comparison => {
+          const prop = "wood";
+          const woodA = a.agent.get<number>(prop).unwrap();
+          const woodB = b.agent.get<number>(prop).unwrap();
+          if (woodA < 5 && 5 > woodB) {
+            return numCmp(woodA, woodB);
+          }
+          if (woodA > 10 && woodB <= 10) {
+            return cmp.LT;
+          }
+          if (woodA <= 10 && woodB > 10) {
+            return cmp.GT;
+          }
+          if (woodA > 10 && 10 < woodB) {
+            return numCmp(woodB, woodA);
+          }
+          return cmp.EQ;
+        })
+        .build();
+    })
+    .expect((NotStarving) => {
+      return NotStarving.name("dont-starve")
+        .target("agent")
+        .prop("hunger")
+        .checker((agent: IStore) => {
+          const hunger = agent.get<number>("hunger").unwrap();
+          return hunger < 50;
+        })
+        .comparer((a: Concept, b: Concept) => {
+          const hungerA = a.agent.get<number>("hunger").unwrap();
+          const hungerB = b.agent.get<number>("hunger").unwrap();
+          if (hungerA < 10 && hungerB < 10) return cmp.EQ;
+          return numCmp(hungerB, hungerA);
+        })
+        .build();
+    })
+    .build();
+
   const getWood: Action = {
-    name: "get wood",
+    name: "get_wood",
     cost: 4,
-    canPerform: (agent: IStore, world: IStore) => {
+    canPerform: (_agent: IStore, world: IStore) => {
       const maybeWood = world.get("wood");
       if (!Option.is_some(maybeWood)) {
         return false;
@@ -460,12 +561,13 @@ run(function* main() {
       return wood >= 2;
     },
     effects: [
-      takeFromWorldEffect(2, "wood"),
+      changeAmtEffect(-2, "world", "wood"),
+      changeAmtEffect(2, "agent", "wood"),
       changeAmtEffect(4, "agent", "hunger"),
     ],
   };
   const addWoodToFire: Action = {
-    name: "add wood to fire",
+    name: "feed_fire",
     cost: 2,
     canPerform: (agent: IStore, world: IStore) => {
       const woodOpt = agent.get("wood");
@@ -485,58 +587,105 @@ run(function* main() {
       changeAmtEffect(2, "agent", "hunger"),
     ],
   };
+  const fireDecay: Action = {
+    name: "fire_decay",
+    cost: 0,
+    canPerform: (_agent: IStore, world: IStore) => {
+      const fire = world.get<number>("fire").unwrap();
+      return fire > 0;
+    },
+    effects: [changeAmtEffect(-1, "world", "fire")],
+  };
   const eatFood: Action = {
-    name: "eat food",
+    name: "eat_food",
     cost: 1,
-    canPerform: (agent: IStore, world: IStore) => {
+    canPerform: (agent: IStore, _world: IStore) => {
       const food = agent.get<number>("food").unwrap();
-      return food > 0;
+      const hunger = agent.get<number>("hunger").unwrap();
+      return food > 0 && hunger > 2;
     },
     effects: [
       changeAmtEffect(-1, "agent", "food"),
-      changeAmtEffect(4, "agent", "hunger"),
+      changeAmtEffect([-4, 0, 100], "agent", "hunger"),
     ],
   };
+  const ambient = [fireDecay];
   planner.setActions([NOOP, getWood, eatFood, addWoodToFire]);
-  const agent = createPseudoAgent("agent");
-  agent.put("pos", [0, 0]);
-  agent.put("wood", 0);
-  agent.put("food", 20);
-  agent.put("hunger", 0);
+  planner.setAmbientActions(ambient);
+  const agent = pseudoAgentSetup("Agent", {
+    pos: [0, 0],
+    wood: 0,
+    food: 20,
+    hunger: 0,
+  });
   agent.print();
-  const world = createPseudoAgent("world");
-  world.put("fire", 9);
-  world.put("wood", 20);
-  // world.put("wood", [[1, 1]]);
+  const world = pseudoAgentSetup("World", {
+    fire: 9,
+    wood: 50,
+  });
   world.print();
-  const maybePlan = planner.plan(goal, agent, world);
+
+  console.time("planning");
+  const maybePlan = planner.plan(surviveGoal, agent, world);
+  console.timeEnd("planning");
+
   if (!Option.is_some(maybePlan)) {
     console.log("Failed to develop a plan");
     return;
   }
-  const plan = maybePlan.unwrap();
-  let planCompleted = true;
-  for (let i = plan.length - 1; i >= 0; --i) {
+  const plan = maybePlan.unwrap().filter((a) => a != NOOP);
+  {
+    // Just for a nice looking log
+    const devPlan = plan
+      .slice()
+      .map((a) => a.name)
+      .reduce(
+        (m, a) => {
+          if (m.length == 0) {
+            m.push([a, 1]);
+            return m;
+          }
+          const idx = m.length - 1;
+          if (m[idx][0] != a) {
+            m.push([a, 1]);
+          } else {
+            m[idx][1] = m[idx][1] + 1;
+          }
+          return m;
+        },
+        [] as Array<[string, number]>,
+      )
+      .map(([name, count]) => (count > 1 ? `${name} x${count}` : name))
+      .reduce(
+        (str, a, i) =>
+          str.length == 0
+            ? ` 0${i + 1}. ${a}`
+            : `${str}\n ${String(i + 1).padStart(2, "0")}. ${a}`,
+        "",
+      );
+    console.log(`Developed plan: Length: ${plan.length}\n${devPlan}`);
+  }
+
+  for (let i = 0; i < plan.length; ++i) {
+    // Ambient Actions: Stuff that always happens
+    for (const action of ambient) {
+      if (action.canPerform(agent, world)) {
+        applyAction(agent, world, action);
+      }
+    }
     const action = plan[i];
-    console.log(`Attemping action: ${action.name}`);
     if (action.canPerform(agent, world)) {
       applyAction(agent, world, action);
     } else {
-      console.log(`Failed to do action: ${action.name}`);
-      planCompleted = false;
+      console.warn(
+        `Aborting plan! Can't perform action(${String(i + 1).padStart(2, "0")}): ${action.name}`,
+      );
       break;
     }
   }
-  console.log(planCompleted ? "Plan completed!" : "Plan failed!");
-  console.log("Goal Reached?", goalReached(goal, agent, world));
-  const wstate = {} as any;
-  for (const key of world.keys()) {
-    wstate[key] = world.get(key).unwrap();
-  }
-  console.log("World state:", wstate);
-  const astate = {} as any;
-  for (const key of agent.keys()) {
-    astate[key] = agent.get(key).unwrap();
-  }
-  console.log("Agent state:", astate);
+  console.log("Goal Reached?", goalReached(surviveGoal, agent, world));
+  console.log("World end state:");
+  world.print();
+  console.log("Agent end state:");
+  agent.print();
 });
