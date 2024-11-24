@@ -160,7 +160,7 @@ run(function* main() {
       for (const action of maybePlan.unwrap().filter((a) => a != NOOP)) {
         plan.push(action);
       }
-      pretty_print_plan(plan);
+      // pretty_print_plan(plan);
       setTimeout(think, 33);
       return;
     }
@@ -200,34 +200,34 @@ run(function* main() {
   setTimeout(think, 33);
 });
 
-function pretty_print_plan(plan: Array<Action>) {
-  // Just for a nice looking log
-  const devPlan = plan
-    .slice()
-    .map((a) => a.name)
-    .reduce(
-      (m, a) => {
-        if (m.length == 0) {
-          m.push([a, 1]);
-          return m;
-        }
-        const idx = m.length - 1;
-        if (m[idx][0] != a) {
-          m.push([a, 1]);
-        } else {
-          m[idx][1] = m[idx][1] + 1;
-        }
-        return m;
-      },
-      [] as Array<[string, number]>,
-    )
-    .map(([name, count]) => (count > 1 ? `${name} x${count}` : name))
-    .reduce(
-      (str, a, i) =>
-        str.length == 0
-          ? ` 0${i + 1}. ${a}`
-          : `${str}\n ${String(i + 1).padStart(2, "0")}. ${a}`,
-      "",
-    );
-  // console.log(`Developed plan: Length: ${plan.length}\n${devPlan}`);
-}
+// function pretty_print_plan(plan: Array<Action>) {
+//   // Just for a nice looking log
+//   const devPlan = plan
+//     .slice()
+//     .map((a) => a.name)
+//     .reduce(
+//       (m, a) => {
+//         if (m.length == 0) {
+//           m.push([a, 1]);
+//           return m;
+//         }
+//         const idx = m.length - 1;
+//         if (m[idx][0] != a) {
+//           m.push([a, 1]);
+//         } else {
+//           m[idx][1] = m[idx][1] + 1;
+//         }
+//         return m;
+//       },
+//       [] as Array<[string, number]>,
+//     )
+//     .map(([name, count]) => (count > 1 ? `${name} x${count}` : name))
+//     .reduce(
+//       (str, a, i) =>
+//         str.length == 0
+//           ? ` 0${i + 1}. ${a}`
+//           : `${str}\n ${String(i + 1).padStart(2, "0")}. ${a}`,
+//       "",
+//     );
+//   console.log(`Developed plan: Length: ${plan.length}\n${devPlan}`);
+// }
