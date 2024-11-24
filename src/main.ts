@@ -59,7 +59,7 @@ run(function* main() {
     ctx.ellipse(pos.x, pos.y + 10, size.x / 3, size.y / 2, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.filleStyle = "rgb(51 0 0)";
+    ctx.fillStyle = "rgb(51 0 0)";
     ctx.fillText(`Lifetime: ${life}`, pos.x + size.x / 2, pos.y - 50);
     ctx.fillText(
       `Last Decay: ${((decayRate - (Date.now() - decayTimestamp)) / 1_000).toFixed(2)}`,
